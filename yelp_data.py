@@ -100,7 +100,7 @@ neighbors2000 = getNeighbors(rpdf, 10, 2000)
 print("Restaurant {0} has {1} neighbors.".format(neighbors2000[0], neighbors2000[1].shape[0])
 # Now, read in the shapefiles for US states and Canadian provinces in order to map in geopandas:
 usashp = './states21basic.shp' # Add file path, and you'll need all the attached files, specifically of type .dbf, .prj, .shp, and .shx, otherwise it won't work
-canshp = './canada.shp'
+canshp = './Canada_AL263.shp'
 USA = gpd.read_file(usashp)
 CAN = gpd.read_file(canshp)
 
@@ -133,3 +133,6 @@ base2 = NorAm.boundary.plot(figsize=[64,32])
 allresloc = gpd.GeoDataFrame(rpdf, geometry=gpd.points_from_xy(rpdf['longitude'], rpdf['latitude']), crs={"init":"EPSG:4326"})
 allresloc.plot(ax=base2, figsize=[64,32],color='red',markersize=0.5)
 plt.title('Locations of Restaurants in Yelp Dataset throughout North America: {0}'.format(neighbors2000_2[0]),fontsize=32)
+
+# Stop spark session
+spark.stop()
