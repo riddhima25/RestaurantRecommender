@@ -81,23 +81,40 @@ def preprocess_user_data(df):
     return df
 
 if __name__ == '__main__':
-    spark = SparkSession.builder.appName('Yelp Data').getOrCreate()  
+    spark = SparkSession.builder \
+    .master('local[*]') \
+    .config("spark.driver.memory", "15g") \
+    .appName('yelp-recs') \
+    .getOrCreate()
 
     # Reading data into dataframes  
-    business = ['Business Data', business_json_path]
-    user = ['User Data', user_json_path]
+    # business = ['Business Data', business_json_path]
+    # user = ['User Data', user_json_path]
     review = ['Review Data', review_json_path]
 
-    busDF = preprocess_bus_data(readfile(business))
-    userDF = preprocess_user_data(readfile(user))
+    # busDF = preprocess_bus_data(readfile(business))
+    # userDF = preprocess_user_data(readfile(user))
     reviewDF = preprocess_review_data(readfile(review))
-
-    # TODO: Need to figure out why this is causing heap error
-    # Attempt at collaborative filtering (causes heap error):
-    # als = ALS(maxIter=5, regParam=0.01, userCol="user_id_ind", itemCol="business_id_ind", ratingCol="stars",
-    #       coldStartStrategy="drop")
-    # model = als.fit(reviewDF)
-    # userRecs = model.recommendForAllUsers(10)
-    # #can also do: itemRecs = model.recommendForAllItems(10) to get top user recs for each movie    
+    revDF = reviewDF.select('user_id_ind','business_id_ind','stars')
+    udf = UserDefinedFunction(lambda x: int(x), IntegerType())
+    revDF = revDF.withColumn('user_id_int', udf(revDF.user_id_ind))
+    revDF = revDF.drop('user_id_ind')
+    revDF = revDF.withColumn('business_id_int', udf(revDF.business_id_ind))
+    revDF = revDF.drop('business_id_ind')
+    revDF.printSchema()
+    (sample, rest) = revDF.randomSplit([0.2, 0.8])
+    (training, test) = sample.randomSplit([0.7, 0.3])
+    training.cache()
+    test.cache()
+    print('starting to train')
+    als = ALS(maxIter=5, regParam=0.01, userCol="user_id_int", itemCol="business_id_int", 
+          ratingCol="stars", coldStartStrategy="drop")
+    model = als.fit(training)
+    predictions = model.transform(test)
+    print('done predicting')
+    print('getting recs for all users')
+    userRecs = model.recommendForAllUsers(10)
+    recs = userRecs.filter(userRecs['user_id_int']==1808).show(5)
+    print('done')
     spark.stop()
 
