@@ -1,12 +1,14 @@
 import pyspark
 from pyspark.sql import SparkSession
-from pyspark.ml.feature import StringIndexer, OneHotEncoderEstimator, VectorAssembler
+from pyspark.ml.feature import StringIndexer, OneHotEncoderEstimator, VectorAssembler, StandardScaler
 from pyspark.ml import Pipeline
 from pyspark.sql import functions as f
-from pyspark.sql.functions import UserDefinedFunction
+from pyspark.sql.functions import UserDefinedFunction, array
+from pyspark.sql.functions import sum as _sum
 from pyspark.sql.types import DoubleType, IntegerType
 from pyspark.ml.recommendation import ALS
 import time
+from pyspark.sql.functions import col, unix_timestamp
 
 bucket = "rest-recs-bucket"    # Replace with own bucket name
 business_json_path = 'gs://{}/input/yelp_academic_dataset_business.json'.format(bucket)
@@ -72,49 +74,76 @@ def preprocess_review_data(df):
     
 def preprocess_user_data(df):
     # TODO: Need to figure out how we want to represent friends attribute + assemble into vector
+    drop_list = ['compliment_cool', 'compliment_cute', 'compliment_hot', 'compliment_list', 'compliment_more', 
+                    'compliment_note', 'compliment_photos', 'compliment_plain', 'compliment_profile', 
+                     'compliment_writer', 'compliment_funny', 'friends', 'name']
+    users = df.select([c for c in df.columns if c not in drop_list])
+
+    # get all features to long/double
+    indexer = StringIndexer(inputCol='user_id', outputCol='user_id_int')
+    userIndexModel = indexer.fit(users)
+    users = userIndexModel.transform(users)
+
+    users = users.withColumn("yelping_since_date", unix_timestamp(col("yelping_since")))
+    users = users.drop('yelping_since')
+
     udf = UserDefinedFunction(lambda x: len(x.split(',')) if x != '' else 0, IntegerType())
-    df = df.withColumn('num_years_elite', udf(df.elite))
-    df = df.drop('elite')
-    udf = UserDefinedFunction(lambda x: time.mktime(time.strptime(x, '%Y-%m-%d %H:%M:%S')), DoubleType())
-    df = df.withColumn('yelping_since_num', udf(df.yelping_since))
-    df = df.drop('yelping_since')
-    return df
+    users = users.withColumn('num_years_elite', udf(users.elite))
+    users = users.drop('elite')
+
+    # assemble vector + standardize
+    feat_cols = [c for c in users.columns if c not in ['user_id', 'user_id_int']]
+    assembler = VectorAssembler(inputCols=feat_cols,outputCol="vector")
+    scaler = StandardScaler(inputCol="vector", outputCol="features",
+                            withStd=True, withMean=True)
+    users = assembler.transform(users)
+    users = scaler.fit(users).transform(users)
+
+    users = users.select('user_id', 'user_id_int', 'average_stars', 'features')
+    return users
+
+def user_similarities_for_collab(users):
+    udf = UserDefinedFunction(lambda arr: 
+                          float(arr[0].dot(arr[1])) / (float(arr[0].norm(2)) * float(arr[1].norm(2))), 
+                          DoubleType())
+    users2 = users.select(*(col(x).alias(x + '_2') for x in users.columns))
+    users2.cache()
+    similarities = users.join(users2, col('user_id') != col('user_id_2'))
+    similarities = similarities.withColumn("similarity", udf(array(similarities.features, similarities.features_2)))
+    return similarities
+
+def get_recommendations_for_user(similarities, users, reviews):
+    # once we change this to take in target_user, get rid of following line:
+    target_user = users.select('user_id').collect()[0]['user_id']
+    
+    target_avg_stars = users.where(col('user_id') == target_user).select('average_stars').collect()[0]['average_stars']
+    top_users = similarities.where(col('user_id') == target_user).sort('similarity', ascending=False).limit(10)
+    top_users = top_users.select('user_id_2','average_stars_2','similarity').cache()
+    reviews = reviews.withColumnRenamed('user_id','rev_user_id').cache()
+    similar_ratings = reviews.join(top_users, 
+                               reviews.rev_user_id == top_users.user_id_2)
+    similar_ratings = similar_ratings.withColumn('score',col('stars')-col('average_stars_2'))
+    similar_ratings = similar_ratings.withColumn('score',col('score')*col('similarity')+target_avg_stars)
+    similar_ratings = similar_ratings.select('business_id','score','user_id_2')
+    similar_ratings.cache()
+    similar_ratings = similar_ratings.groupBy("business_id").agg(_sum("score").alias("final_score"))
+    recs = similar_ratings.sort('final_score', ascending=False).limit(10)
+    return recs
 
 if __name__ == '__main__':
     spark = SparkSession.builder \
-    .master('local[*]') \
-    .config("spark.driver.memory", "15g") \
+    .config("spark.driver.memory","8g") \
     .appName('yelp-recs') \
     .getOrCreate()
 
-    # Reading data into dataframes  
-    # business = ['Business Data', business_json_path]
-    # user = ['User Data', user_json_path]
+    user = ['User Data', user_json_path]
+    userDF = readfile(user)
     review = ['Review Data', review_json_path]
+    reviews = readfile(review)
 
-    # busDF = preprocess_bus_data(readfile(business))
-    # userDF = preprocess_user_data(readfile(user))
-    reviewDF = preprocess_review_data(readfile(review))
-    revDF = reviewDF.select('user_id_ind','business_id_ind','stars')
-    udf = UserDefinedFunction(lambda x: int(x), IntegerType())
-    revDF = revDF.withColumn('user_id_int', udf(revDF.user_id_ind))
-    revDF = revDF.drop('user_id_ind')
-    revDF = revDF.withColumn('business_id_int', udf(revDF.business_id_ind))
-    revDF = revDF.drop('business_id_ind')
-    revDF.printSchema()
-    (sample, rest) = revDF.randomSplit([0.2, 0.8])
-    (training, test) = sample.randomSplit([0.7, 0.3])
-    training.cache()
-    test.cache()
-    print('starting to train')
-    als = ALS(maxIter=5, regParam=0.01, userCol="user_id_int", itemCol="business_id_int", 
-          ratingCol="stars", coldStartStrategy="drop")
-    model = als.fit(training)
-    predictions = model.transform(test)
-    print('done predicting')
-    print('getting recs for all users')
-    userRecs = model.recommendForAllUsers(10)
-    recs = userRecs.filter(userRecs['user_id_int']==1808).show(5)
-    print('done')
-    spark.stop()
+    users = preprocess_user_data(userDF).cache().sort(col('user_id_int'), ascending=True).limit(40)
+    similarities = user_similarities_for_collab(users).cache()
+    # once we get rid of sort/limit on users, pass in target_user to following function
+    recs = get_recommendations_for_user(similarities, users, reviews)
+    recs.show(10)
 
