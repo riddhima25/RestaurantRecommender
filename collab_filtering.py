@@ -94,22 +94,24 @@ def preprocess_user_data(df):
     # assemble vector + standardize
     feat_cols = [c for c in users.columns if c not in ['user_id', 'user_id_int']]
     assembler = VectorAssembler(inputCols=feat_cols,outputCol="vector")
-    scaler = StandardScaler(inputCol="vector", outputCol="features",
+    scaler = StandardScaler(inputCol="vector", outputCol="features_unnormed",
                             withStd=True, withMean=True)
     users = assembler.transform(users)
     users = scaler.fit(users).transform(users)
-
+    normalizer = Normalizer(inputCol="features_unnormed", outputCol="features")
+    users = normalizer.transform(users)
     users = users.select('user_id', 'user_id_int', 'average_stars', 'features')
     return users
 
 def user_similarities_for_collab(users):
-    udf = UserDefinedFunction(lambda arr: 
-                          float(arr[0].dot(arr[1])) / (float(arr[0].norm(2)) * float(arr[1].norm(2))), 
-                          DoubleType())
+    # vectors already normalized during preprocessing
+    udf = UserDefinedFunction(lambda arr: float(arr[0].dot(arr[1])), DoubleType())
     users2 = users.select(*(col(x).alias(x + '_2') for x in users.columns))
     users2.cache()
     similarities = users.join(users2, col('user_id') != col('user_id_2'))
-    similarities = similarities.withColumn("similarity", udf(array(similarities.features, similarities.features_2)))
+    similarities = similarities.withColumn("similarity_unnormed", udf(array(similarities.features, similarities.features_2)))
+    mean_sim, sttdev_sim = similarities.select(mean("similarity_unnormed"), stddev("similarity_unnormed")).first()
+    similarities = similarities.withColumn("similarity", (col("similarity_unnormed") - mean_sim) / sttdev_sim)
     return similarities
 
 def get_recommendations_for_user(similarities, users, reviews):
@@ -117,16 +119,18 @@ def get_recommendations_for_user(similarities, users, reviews):
     target_user = users.select('user_id').collect()[0]['user_id']
     
     target_avg_stars = users.where(col('user_id') == target_user).select('average_stars').collect()[0]['average_stars']
-    top_users = similarities.where(col('user_id') == target_user).sort('similarity', ascending=False).limit(10)
+    top_users = similarities.where(col('user_id') == target_user).sort('similarity', ascending=False)
     top_users = top_users.select('user_id_2','average_stars_2','similarity').cache()
     reviews = reviews.withColumnRenamed('user_id','rev_user_id').cache()
     similar_ratings = reviews.join(top_users, 
-                               reviews.rev_user_id == top_users.user_id_2)
-    similar_ratings = similar_ratings.withColumn('score',col('stars')-col('average_stars_2'))
-    similar_ratings = similar_ratings.withColumn('score',col('score')*col('similarity')+target_avg_stars)
-    similar_ratings = similar_ratings.select('business_id','score','user_id_2')
+                               reviews.rev_user_id == top_users.user_id_2) \
+                      .filter(col('stars') > 3.0)
+    similar_ratings = similar_ratings.withColumn('score',(col('stars')-col('average_stars_2'))*col('similarity'))
+    similar_ratings = similar_ratings.select('business_id','score','user_id_2', 'similarity')
     similar_ratings.cache()
-    similar_ratings = similar_ratings.groupBy("business_id").agg(_sum("score").alias("final_score"))
+    similar_ratings = similar_ratings.withColumn('abs_similarity', _abs(col('similarity')))
+    similar_ratings = similar_ratings.groupBy("business_id").agg(_sum("score").alias("sum_score"),_sum("abs_similarity").alias("sum_similarity"))
+    similar_ratings = similar_ratings.withColumn("final_score", target_avg_stars + (col("sum_score")/(col("sum_similarity"))))
     recs = similar_ratings.sort('final_score', ascending=False).limit(10)
     return recs
 
@@ -136,14 +140,31 @@ if __name__ == '__main__':
     .appName('yelp-recs') \
     .getOrCreate()
 
+    spark = SparkSession.builder \
+    .config("spark.driver.memory","8g") \
+    .appName('yelp-recs') \
+    .config("spark.sql.broadcastTimeout", "1200") \
+    .getOrCreate()
+
     user = ['User Data', user_json_path]
     userDF = readfile(user)
     review = ['Review Data', review_json_path]
     reviews = readfile(review)
 
-    users = preprocess_user_data(userDF).cache().sort(col('user_id_int'), ascending=True).limit(40)
+    print("Start preprocessing=\t{0}".format(time.ctime(time.time())))
+    users = preprocess_user_data(userDF).cache().sort(col('user_id_int'), ascending=True).limit(1000)
+    users.take(1)
+    print("Done preprocessing=\t{0}".format(time.ctime(time.time())))
+
+    print("Start similarities=\t{0}".format(time.ctime(time.time())))
     similarities = user_similarities_for_collab(users).cache()
+    similarities.take(1)
+    print("Done similarities=\t{0}".format(time.ctime(time.time())))
     # once we get rid of sort/limit on users, pass in target_user to following function
-    recs = get_recommendations_for_user(similarities, users, reviews)
+    print("Start recs=\t{0}".format(time.ctime(time.time())))
+    recs = get_recommendations_for_user(similarities, users, reviews).cache()
     recs.show(10)
+    print("Done recs=\t{0}".format(time.ctime(time.time())))
+
+    spark.stop()
 
