@@ -23,57 +23,8 @@ def readfile(datatype):
     print("{0} End-time=\t{1}".format(datatype[0], time.ctime(end)))
     print("Time elapsed=\t{0} s \n".format(end-start))
     return DF
-
-def flatten_df(nested_df):
-    flat_cols = [c[0] for c in nested_df.dtypes if c[1][:6] != 'struct']
-    nested_cols = [c[0] for c in nested_df.dtypes if c[1][:6] == 'struct']
-
-    flat_df = nested_df.select(flat_cols +
-                               [f.col(nc+'.'+c).alias(nc+'_'+c)
-                                for nc in nested_cols
-                                for c in nested_df.select(nc+'.*').columns])
-    return flat_df
-
-def preprocess_bus_data(df):
-    # TODO: Need to handle categories field + assemble into vector
-    df = flatten_df(df)
-    cat_cols = list(set(df.columns) - set(['is_open', 'latitude', 'longitude', 'review_count', 'stars']))
-    ind_cols = [col+'_ind' for col in cat_cols]
-    indexers = [
-        StringIndexer(inputCol=col, outputCol=new_col)
-        for col, new_col in zip(cat_cols, ind_cols)
-    ]
-    pipeline = Pipeline(stages=indexers)
-    processed_df = pipeline.fit(df).transform(df)
-    return processed_df
-
-def preprocess_review_data(df): 
-    udf = UserDefinedFunction(lambda x: time.mktime(time.strptime(x, '%Y-%m-%d %H:%M:%S')), DoubleType())
-    df = df.withColumn('date_num', udf(df.date))
-    df = df.drop('date')
-    cat_cols = ['business_id', 'review_id', 'user_id']
-    index_cols = [col+'_ind' for col in cat_cols]
-    indexers = [
-        StringIndexer(inputCol=col, outputCol=new_col)
-        for col, new_col in zip(cat_cols, index_cols)
-    ]
-    
-    # Causing this to take a long time + not sure if needed:
-    # vector_cols = [col+'_vector' for col in cat_cols]
-    # encoder = [OneHotEncoderEstimator(inputCols=index_cols, outputCols=vector_cols)]
-    
-    # not processing review text for now
-    feat_cols = ['business_id_ind', 'cool', 'date_num', 'funny', 'stars', 'useful', 'user_id_ind']
-    assembler = VectorAssembler(inputCols=feat_cols,outputCol="vector")
-    
-    pipeline = Pipeline(stages=indexers+[assembler])
-    model = pipeline.fit(df)
-    processed_df = model.transform(df)
-    # split = processed_df.randomSplit([0.7,0.3], seed=100)
-    return processed_df
     
 def preprocess_user_data(df):
-    # TODO: Need to figure out how we want to represent friends attribute + assemble into vector
     drop_list = ['compliment_cool', 'compliment_cute', 'compliment_hot', 'compliment_list', 'compliment_more', 
                     'compliment_note', 'compliment_photos', 'compliment_plain', 'compliment_profile', 
                      'compliment_writer', 'compliment_funny', 'friends', 'name']
@@ -138,12 +89,6 @@ if __name__ == '__main__':
     spark = SparkSession.builder \
     .config("spark.driver.memory","8g") \
     .appName('yelp-recs') \
-    .getOrCreate()
-
-    spark = SparkSession.builder \
-    .config("spark.driver.memory","8g") \
-    .appName('yelp-recs') \
-    .config("spark.sql.broadcastTimeout", "1200") \
     .getOrCreate()
 
     user = ['User Data', user_json_path]
